@@ -23,11 +23,12 @@ import com.axelor.apps.base.db.ImportHistory;
 import com.axelor.exception.AxelorException;
 import java.io.IOException;
 import java.util.Map;
+import wslite.json.JSONException;
 
 public interface DataImportService {
 
   public ImportHistory importData(AdvancedImport advanceImport)
       throws IOException, AxelorException, ClassNotFoundException;
 
-  public Map<String, Object> createJsonContext(FileTab fileTab);
+  public Map<String, Object> createJsonContext(FileTab fileTab) throws JSONException;
 }
