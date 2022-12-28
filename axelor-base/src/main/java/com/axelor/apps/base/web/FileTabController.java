@@ -27,6 +27,9 @@ import com.axelor.common.Inflector;
 import com.axelor.exception.service.TraceBackService;
 import com.axelor.i18n.I18n;
 import com.axelor.inject.Beans;
+import com.axelor.meta.db.MetaJsonModel;
+import com.axelor.meta.db.MetaJsonRecord;
+import com.axelor.meta.db.repo.MetaJsonModelRepository;
 import com.axelor.meta.db.repo.MetaModelRepository;
 import com.axelor.meta.schema.actions.ActionView;
 import com.axelor.rpc.ActionRequest;
@@ -111,16 +114,36 @@ public class FileTabController {
   public void showRecords(ActionRequest request, ActionResponse response) {
     HashMap<String, Object> _map = (HashMap<String, Object>) request.getData().get("context");
     String modelName = (String) _map.get("model");
-    String modelFullName = Beans.get(MetaModelRepository.class).findByName(modelName).getFullName();
+
+    boolean isJson = (boolean) _map.get("isJson");
     String ids = (String) _map.get("ids");
 
-    String viewName = Inflector.getInstance().dasherize(modelName);
+    String modelFullName = MetaJsonRecord.class.getCanonicalName();
+    String gridViewName = "";
+    String formViewName = "";
+
+    if (isJson) {
+      MetaJsonModel jsonModel = Beans.get(MetaJsonModelRepository.class).findByName(modelName);
+      gridViewName = jsonModel.getGridView().getName();
+      formViewName = jsonModel.getFormView().getName();
+    } else {
+      String viewName = Inflector.getInstance().dasherize(modelName);
+      modelFullName = Beans.get(MetaModelRepository.class).findByName(modelName).getFullName();
+      gridViewName = viewName + "-grid";
+      formViewName = viewName + "-form";
+    }
+
     response.setView(
         ActionView.define(I18n.get(modelName))
             .model(modelFullName)
-            .add("grid", viewName + "-grid")
-            .add("form", viewName + "-form")
+            .add("grid", gridViewName)
+            .add("form", formViewName)
             .domain("self.id IN (" + ids + ")")
             .map());
+  }
+
+  public void updateIsJson(ActionRequest request, ActionResponse response) {
+    FileTab fileTab = request.getContext().asType(FileTab.class);
+    Beans.get(FileTabService.class).setIsJson(fileTab);
   }
 }

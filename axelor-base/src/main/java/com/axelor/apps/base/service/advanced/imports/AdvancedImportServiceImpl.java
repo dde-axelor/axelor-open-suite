@@ -23,6 +23,7 @@ import com.axelor.apps.base.db.FileTab;
 import com.axelor.apps.base.db.repo.AdvancedImportRepository;
 import com.axelor.apps.base.db.repo.FileFieldRepository;
 import com.axelor.apps.base.exceptions.BaseExceptionMessage;
+import com.axelor.apps.base.service.advancedExport.AdvancedExportService;
 import com.axelor.apps.tool.reader.DataReaderFactory;
 import com.axelor.apps.tool.reader.DataReaderService;
 import com.axelor.db.JpaRepository;
@@ -34,8 +35,11 @@ import com.axelor.exception.db.repo.TraceBackRepository;
 import com.axelor.i18n.I18n;
 import com.axelor.inject.Beans;
 import com.axelor.meta.db.MetaField;
+import com.axelor.meta.db.MetaJsonModel;
 import com.axelor.meta.db.MetaModel;
 import com.axelor.meta.db.repo.MetaFieldRepository;
+import com.axelor.meta.db.repo.MetaJsonFieldRepository;
+import com.axelor.meta.db.repo.MetaJsonModelRepository;
 import com.axelor.meta.db.repo.MetaModelRepository;
 import com.google.common.base.Strings;
 import com.google.common.io.Files;
@@ -70,7 +74,11 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
 
   @Inject private MetaModelRepository metaModelRepo;
 
+  @Inject private MetaJsonModelRepository metaJsonModelRepo;
+
   @Inject private MetaFieldRepository metaFieldRepo;
+
+  @Inject private MetaJsonFieldRepository metaJsonFieldRepo;
 
   @Inject private DataReaderFactory dataReaderFactory;
 
@@ -81,6 +89,8 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
   @Inject private FileFieldRepository fileFieldRepository;
 
   @Inject private DataImportService dataImportService;
+
+  @Inject private CustomAdvancedImportService customAdvancedImportService;
 
   @Override
   public boolean apply(AdvancedImport advancedImport)
@@ -133,6 +143,7 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
       FileTab fileTab = new FileTab();
       fileTab.setName(sheet);
       fileTab.setSequence(fileTabSequence);
+      fileTab.setIsJson(advancedImport.getIsJson());
       fileTabSequence++;
 
       String[] objectRow = reader.read(sheet, startIndex, 0);
@@ -148,6 +159,12 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
       isValid = this.applyObject(objectRow, fileTab, isConfig, linesToIgnore, isTabConfig);
       if (!isValid) {
         break;
+      }
+
+      if (isConfig && fileTab.getJsonModel() == null && fileTab.getMetaModel() == null) {
+        throw new AxelorException(
+            TraceBackRepository.CATEGORY_CONFIGURATION_ERROR,
+            I18n.get(BaseExceptionMessage.ADVANCED_IMPORT_LOG_1));
       }
 
       List<FileField> fileFieldList = new ArrayList<>();
@@ -168,7 +185,8 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
       }
 
       if (isConfig) {
-        fileFieldList.removeIf(field -> field.getImportField() == null);
+        fileFieldList.removeIf(
+            field -> (field.getImportField() == null && field.getJsonField() == null));
         if (!fileTab.getImportType().equals(FileFieldRepository.IMPORT_TYPE_NEW)) {
           fileTab = this.setSearchField(fileTab, searchFieldList, fileFieldList);
         }
@@ -232,7 +250,7 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
       int tabConfigRowCount)
       throws AxelorException, ClassNotFoundException {
 
-    Mapper mapper = getMapper(fileTab.getMetaModel().getFullName());
+    Mapper mapper = fileTab.getIsJson() ? null : getMapper(fileTab.getMetaModel().getFullName());
     FileField fileField = null;
 
     int index = 0;
@@ -308,6 +326,7 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
         fileField.setIsMatchWithFile(true);
         fileFieldList.add(fileField);
         fileField.setFileTab(fileTab);
+        fileField.setIsJson(fileTab.getIsJson());
 
         if (isHeader) {
           fileField.setColumnTitle(value);
@@ -371,7 +390,10 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
       throws AxelorException, ClassNotFoundException {
 
     FileField fileField = new FileField();
+    boolean isJson = fileTab.getIsJson();
+
     fileField.setSequence(index);
+    fileField.setIsJson(isJson);
     if (Strings.isNullOrEmpty(value)) {
       return;
     }
@@ -397,10 +419,17 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
       importField = value;
     }
 
-    boolean isValid = this.checkFields(mapper, importField, subImportField);
+    boolean isValid =
+        isJson
+            ? customAdvancedImportService.checkJsonField(fileTab, importField, subImportField)
+            : this.checkFields(mapper, importField, subImportField);
 
     if (isValid) {
-      this.setImportFields(mapper, fileField, importField, subImportField);
+      if (isJson) {
+        customAdvancedImportService.setJsonFields(fileTab, fileField, importField, subImportField);
+      } else {
+        this.setImportFields(mapper, fileField, importField, subImportField);
+      }
     } else {
       ignoreFields.add(index);
     }
@@ -428,24 +457,36 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
         return false;
       }
 
-      if (!Strings.isNullOrEmpty(subImportField)) {
-        String[] subFields = subImportField.split("\\.");
-        return this.checkSubFields(
-            subFields, 0, parentProp, parentProp.getEntity().getSimpleName());
+      String[] subFields =
+          Strings.isNullOrEmpty(subImportField) ? new String[0] : subImportField.split("\\.");
+      if (AdvancedExportService.FIELD_ATTRS.equals(parentProp.getName())) {
 
-      } else if (parentProp.getTarget() != null) {
-        throw new AxelorException(
-            TraceBackRepository.CATEGORY_CONFIGURATION_ERROR,
-            String.format(
-                I18n.get(BaseExceptionMessage.ADVANCED_IMPORT_5),
-                importField,
-                mapper.getBeanClass().getSimpleName()));
+        customAdvancedImportService.checkAttrsSubField(
+            subFields,
+            0,
+            mapper.getBeanClass().getCanonicalName(),
+            importField,
+            mapper.getBeanClass().getSimpleName());
+      } else {
+        if (!Strings.isNullOrEmpty(subImportField)) {
+
+          return this.checkSubFields(
+              subFields, 0, parentProp, parentProp.getEntity().getSimpleName());
+
+        } else if (parentProp.getTarget() != null) {
+          throw new AxelorException(
+              TraceBackRepository.CATEGORY_CONFIGURATION_ERROR,
+              String.format(
+                  I18n.get(BaseExceptionMessage.ADVANCED_IMPORT_5),
+                  importField,
+                  mapper.getBeanClass().getSimpleName()));
+        }
       }
     }
     return true;
   }
 
-  private boolean checkSubFields(String[] subFields, int index, Property parentProp, String model)
+  public boolean checkSubFields(String[] subFields, int index, Property parentProp, String model)
       throws AxelorException, ClassNotFoundException {
     boolean isValid = true;
 
@@ -463,18 +504,37 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
                   parentProp.getName(),
                   model));
         }
+
+        index += 1;
         if (childProp.getTarget() != null) {
           if (childProp.getType().name().equals("ONE_TO_MANY")) {
             isValid = false;
             return isValid;
           }
-          if (index != subFields.length - 1) {
-            isValid = this.checkSubFields(subFields, index + 1, childProp, model);
+          if (index < subFields.length) {
+            isValid = this.checkSubFields(subFields, index, childProp, model);
           } else {
             throw new AxelorException(
                 TraceBackRepository.CATEGORY_CONFIGURATION_ERROR,
                 String.format(
-                    I18n.get(BaseExceptionMessage.ADVANCED_IMPORT_5), subFields[index], model));
+                    I18n.get(BaseExceptionMessage.ADVANCED_IMPORT_5), subFields[index - 1], model));
+          }
+        } else {
+          if (AdvancedExportService.FIELD_ATTRS.equals(childProp.getName())) {
+            customAdvancedImportService.checkAttrsSubField(
+                subFields,
+                index,
+                mapper.getBeanClass().getCanonicalName(),
+                childProp.getName(),
+                mapper.getBeanClass().getSimpleName());
+          } else if (index < subFields.length) {
+            throw new AxelorException(
+                TraceBackRepository.CATEGORY_CONFIGURATION_ERROR,
+                String.format(
+                    I18n.get(BaseExceptionMessage.ADVANCED_IMPORT_2),
+                    subFields[index],
+                    childProp.getName(),
+                    model));
           }
         }
       }
@@ -494,6 +554,7 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
                 prop.getName(),
                 prop.getEntity().getSimpleName())
             .fetchOne();
+
     fileField.setImportField(field);
     fileField.setIsMatchWithFile(true);
 
@@ -511,8 +572,14 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
 
   private int getImportType(String value, String importType) {
 
+    boolean isRelational =
+        value != null
+            ? !value.startsWith("attrs.")
+                || (value.startsWith("attrs.") && value.split("\\.").length > 2)
+            : false;
+
     if (Strings.isNullOrEmpty(importType)) {
-      if (value.contains(".")) {
+      if (value.contains(".") && isRelational) {
         return FileFieldRepository.IMPORT_TYPE_NEW;
       }
       return FileFieldRepository.IMPORT_TYPE_DIRECT;
@@ -532,7 +599,7 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
         return FileFieldRepository.IMPORT_TYPE_IGNORE_EMPTY;
 
       default:
-        if (value.contains(".")) {
+        if (value.contains(".") && isRelational) {
           return FileFieldRepository.IMPORT_TYPE_NEW;
         }
         return FileFieldRepository.IMPORT_TYPE_DIRECT;
@@ -566,8 +633,13 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
             KEY_IMPORT_TYPE, KEY_OBJECT, KEY_SEARCH_FIELD_SET, KEY_ACTIONS, KEY_SEARCH_CALL);
     Map<String, String> tabConfigDataMap = getTabConfigDataMap(row, KEY_LIST);
 
-    MetaModel model = metaModelRepo.findByName(tabConfigDataMap.get(KEY_OBJECT));
-    fileTab.setMetaModel(model);
+    if (fileTab.getIsJson()) {
+      MetaJsonModel model = metaJsonModelRepo.findByName(tabConfigDataMap.get(KEY_OBJECT));
+      fileTab.setJsonModel(model);
+    } else {
+      MetaModel model = metaModelRepo.findByName(tabConfigDataMap.get(KEY_OBJECT));
+      fileTab.setMetaModel(model);
+    }
 
     if (tabConfigDataMap.containsKey(KEY_IMPORT_TYPE)) {
 
@@ -681,7 +753,11 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
 
     boolean isResetValue = resetRelationalFields(fileTabList);
     if (isResetValue) {
-      removeRecords(fileTabList);
+      if (advancedImport.getIsJson()) {
+        customAdvancedImportService.removeJsonRecords(fileTabList);
+      } else {
+        removeRecords(fileTabList);
+      }
     }
     return isResetValue;
   }
@@ -696,7 +772,8 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
 
       Map<String, Object> jsonContextMap = dataImportService.createJsonContext(fileTab);
       JSONObject jsonObject = (JSONObject) jsonContextMap.get("jsonObject");
-      String fieldName = fileTab.getMetaModel().getName();
+      String fieldName =
+          fileTab.getIsJson() ? "JSON_" + fileTab.getJsonModel().getName() : fileTab.getMetaModel().getName();
       List<String> recordList = Arrays.asList(((String) jsonObject.get(fieldName)).split("\\,"));
 
       if (CollectionUtils.isEmpty(recordList)) {
@@ -705,7 +782,11 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
       isResetValue = true;
 
       Class<? extends Model> modelKlass =
-          (Class<? extends Model>) Class.forName(fileTab.getMetaModel().getFullName());
+          (Class<? extends Model>)
+              Class.forName(
+                  fileTab.getIsJson()
+                      ? "com.axelor.meta.db.MetaJsonRecord"
+                      : fileTab.getMetaModel().getFullName());
       this.resetPropertyValue(modelKlass, recordList);
       this.resetSubPropertyValue(modelKlass, jsonObject);
     }
@@ -831,6 +912,17 @@ public class AdvancedImportServiceImpl implements AdvancedImportService {
       throws ClassNotFoundException, JSONException {
 
     for (Property prop : Mapper.of(klass).getProperties()) {
+
+      if (AdvancedExportService.FIELD_ATTRS.equals(prop.getName())) {
+        Class<? extends Model> modelKlass =
+            (Class<? extends Model>)
+                Class.forName(AdvancedExportService.META_JSON_RECORD_FULL_NAME);
+        customAdvancedImportService.removeJsonSubRecords(
+            modelKlass,
+            metaJsonFieldRepo.all().filter("self.model = ?1", klass.getCanonicalName()).fetch(),
+            jsonObject);
+      }
+
       if (prop.getTarget() == null || prop.isCollection()) {
         continue;
       }

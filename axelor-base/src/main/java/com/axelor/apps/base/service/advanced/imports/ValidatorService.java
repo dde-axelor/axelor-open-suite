@@ -23,6 +23,7 @@ import com.axelor.apps.base.db.FileTab;
 import com.axelor.apps.base.db.repo.FileFieldRepository;
 import com.axelor.apps.base.db.repo.FileTabRepository;
 import com.axelor.apps.base.exceptions.BaseExceptionMessage;
+import com.axelor.apps.base.service.advancedExport.AdvancedExportService;
 import com.axelor.apps.tool.reader.DataReaderFactory;
 import com.axelor.apps.tool.reader.DataReaderService;
 import com.axelor.db.Model;
@@ -34,6 +35,8 @@ import com.axelor.exception.service.TraceBackService;
 import com.axelor.i18n.I18n;
 import com.axelor.meta.MetaFiles;
 import com.axelor.meta.db.MetaField;
+import com.axelor.meta.db.MetaJsonField;
+import com.axelor.meta.db.repo.MetaJsonFieldRepository;
 import com.google.common.base.Strings;
 import com.google.common.io.Files;
 import com.google.inject.Inject;
@@ -79,6 +82,8 @@ public class ValidatorService {
 
   @Inject private AdvancedImportService advancedImportService;
 
+  @Inject private CustomValidatorService customValidatorService;
+
   @Inject private FileTabRepository fileTabRepo;
 
   @Inject private ActionService actionService;
@@ -86,6 +91,8 @@ public class ValidatorService {
   @Inject private DataReaderFactory dataReaderFactory;
 
   @Inject private LogService logService;
+
+  @Inject private MetaJsonFieldRepository metaJsonFieldRepo;
 
   @Inject private SearchCallService searchCallService;
 
@@ -200,7 +207,7 @@ public class ValidatorService {
   }
 
   private void validateModel(FileTab fileTab) throws IOException, AxelorException {
-    if (fileTab.getMetaModel() == null) {
+    if (fileTab.getMetaModel() == null && fileTab.getJsonModel() == null) {
       throw new AxelorException(
           TraceBackRepository.CATEGORY_CONFIGURATION_ERROR,
           String.format(
@@ -228,6 +235,10 @@ public class ValidatorService {
       if (fileTab.getMetaModel() != null && !fileTab.getMetaModel().getName().equals(model)) {
         logService.addLog(
             LogService.COMMON_KEY, BaseExceptionMessage.ADVANCED_IMPORT_LOG_1, rowIndex);
+      } else if (fileTab.getJsonModel() != null
+          && !fileTab.getJsonModel().getName().equals(model)) {
+        logService.addLog(
+            LogService.COMMON_KEY, BaseExceptionMessage.ADVANCED_IMPORT_LOG_1, rowIndex);
       }
     }
   }
@@ -242,17 +253,7 @@ public class ValidatorService {
               I18n.get(BaseExceptionMessage.ADVANCED_IMPORT_NO_FIELDS), fileTab.getName()));
     }
 
-    List<String> fieldList = new ArrayList<String>();
-
-    for (FileField fileField : fileTab.getFileFieldList()) {
-      if (fileField.getImportField() != null) {
-        fieldList.add(fileField.getImportField().getName());
-
-      } else {
-        logService.addLog(
-            BaseExceptionMessage.ADVANCED_IMPORT_LOG_2, fileField.getColumnTitle(), null);
-      }
-    }
+    List<String> fieldList = this.getFieldNameList(fileTab);
 
     if (fileTab.getImportType() == FileFieldRepository.IMPORT_TYPE_FIND) {
       return;
@@ -275,7 +276,45 @@ public class ValidatorService {
           logService.addLog(BaseExceptionMessage.ADVANCED_IMPORT_LOG_3, prop.getName(), null);
         }
       }
+
+      List<MetaJsonField> jsonFields =
+          metaJsonFieldRepo
+              .all()
+              .filter("self.model = ?1", fileTab.getMetaModel().getFullName())
+              .fetch();
+      customValidatorService.validateObjectRequiredJsonFields(jsonFields, fieldList, logService);
+
+    } else if (fileTab.getJsonModel() != null) {
+      customValidatorService.validateObjectRequiredJsonFields(
+          fileTab.getJsonModel().getFields(), fieldList, logService);
     }
+  }
+
+  private List<String> getFieldNameList(FileTab fileTab) {
+    List<String> fieldList = new ArrayList<String>();
+    for (FileField fileField : fileTab.getFileFieldList()) {
+      if (fileField.getImportField() != null) {
+        if (AdvancedExportService.FIELD_ATTRS.equals(fileField.getImportField().getName())) {
+          if (Strings.isNullOrEmpty(fileField.getSubImportField())) {
+            logService.addLog(
+                BaseExceptionMessage.ADVANCED_IMPORT_LOG_4,
+                fileField.getImportField().getName(),
+                null);
+          } else {
+            fieldList.add(StringUtils.substringBefore(fileField.getSubImportField(), "."));
+          }
+        } else {
+          fieldList.add(fileField.getImportField().getName());
+        }
+
+      } else if (fileField.getJsonField() != null) {
+        fieldList.add(fileField.getJsonField().getName());
+      } else {
+        logService.addLog(
+            BaseExceptionMessage.ADVANCED_IMPORT_LOG_2, fileField.getColumnTitle(), null);
+      }
+    }
+    return fieldList;
   }
 
   private void validateFieldAndData(
@@ -307,8 +346,12 @@ public class ValidatorService {
       }
       value = value.trim();
       map.put(isConfig ? value.contains("(") ? value.split("\\(")[0] : value : value, cell);
-      if (cell == row.length - 1) {
-        this.validateFields(startIndex, isConfig, fileTab);
+      if (cell <= row.length - 1) {
+        if (fileTab.getIsJson()) {
+          customValidatorService.validateJsonFields(startIndex, isConfig, fileTab, logService);
+        } else {
+          this.validateFields(startIndex, isConfig, fileTab);
+        }
       }
     }
 
@@ -328,7 +371,11 @@ public class ValidatorService {
       if (dataRow == null) {
         continue;
       }
-      this.validateData(dataRow, line, isConfig, fileTab);
+      if (fileTab.getIsJson()) {
+        customValidatorService.validateJsonData(dataRow, line, isConfig, fileTab, logService, map);
+      } else {
+        this.validateData(dataRow, line, isConfig, fileTab);
+      }
     }
   }
 
@@ -367,19 +414,32 @@ public class ValidatorService {
           return;
         }
 
-        Property subProperty = this.getAndValidateSubField(line, parentProp, fileField, false);
+        Object subObject = null;
+        if (AdvancedExportService.FIELD_ATTRS.equals(importField.getName())) {
+          String field = this.getField(fileField);
+          String subFields[] = fileField.getSubImportField().split("\\.");
+          Integer rowNum = fileField.getIsMatchWithFile() ? line : null;
 
-        if (subProperty != null) {
-          this.validateImportRequiredField(
-              line, subProperty.getEntity(), subProperty.getName(), fileField, relationalFieldList);
+          subObject =
+              customValidatorService.getValidatedAttrsSubField(
+                  subFields,
+                  importField.getMetaModel().getFullName(),
+                  field,
+                  0,
+                  rowNum,
+                  false,
+                  logService);
 
-          this.validateDateField(line, fileField);
+        } else {
+          subObject = this.getAndValidateSubField(line, parentProp, fileField, false);
         }
+        customValidatorService.checkAndValidateObjectRequiredFields(
+            subObject, fileField, relationalFieldList, line, logService);
       }
     }
   }
 
-  private void validateDateField(int line, FileField fileField) throws IOException {
+  public void validateDateField(int line, FileField fileField) throws IOException {
 
     String type = fileField.getTargetType();
     Integer rowNum = fileField.getIsMatchWithFile() ? line : null;
@@ -389,7 +449,10 @@ public class ValidatorService {
             || type.equals(LOCAL_TIME)
             || type.equals(ZONED_DATE_TIME))) {
 
-      String field = getField(fileField);
+      String field =
+          fileField.getIsJson()
+              ? customValidatorService.getJsonFieldName(fileField)
+              : getField(fileField);
 
       if (Strings.isNullOrEmpty(fileField.getDateFormat())
           && Strings.isNullOrEmpty(fileField.getExpression())) {
@@ -399,7 +462,7 @@ public class ValidatorService {
     }
   }
 
-  private void validateImportRequiredField(
+  public void validateImportRequiredField(
       int line,
       Class<?> model,
       String fieldName,
@@ -408,7 +471,10 @@ public class ValidatorService {
       throws IOException, ClassNotFoundException {
 
     Mapper mapper = advancedImportService.getMapper(model.getName());
-    String field = getField(fileField);
+    String field =
+        fileField.getFileTab().getIsJson()
+            ? customValidatorService.getJsonFieldName(fileField)
+            : getField(fileField);
 
     Integer rowNum = fileField.getIsMatchWithFile() ? line : null;
     int importType = fileField.getImportType();
@@ -494,39 +560,41 @@ public class ValidatorService {
             dataRow, cellIndex, line, property.getJavaType().getSimpleName(), fileField);
 
       } else if (!Strings.isNullOrEmpty(fileField.getSubImportField())) {
+        Object object = null;
 
-        Property subProperty = this.getAndValidateSubField(line, property, fileField, true);
+        if (AdvancedExportService.FIELD_ATTRS.equals(property.getName())) {
+          String field = this.getField(fileField);
+          String subFields[] = fileField.getSubImportField().split("\\.");
 
-        if (subProperty != null) {
-          if (this.validateDataRequiredField(
-              dataRow,
-              cellIndex,
-              line,
-              subProperty.getEntity(),
-              subProperty.getName(),
-              fileField)) {
+          object =
+              customValidatorService.getValidatedAttrsSubField(
+                  subFields,
+                  mapper.getBeanClass().getCanonicalName(),
+                  field,
+                  0,
+                  line,
+                  true,
+                  logService);
 
-            continue;
-          }
-
-          if (!Strings.isNullOrEmpty(subProperty.getSelection())
-              && fileField.getForSelectUse() != FileFieldRepository.SELECT_USE_VALUES) {
-            continue;
-          }
-
-          this.validateDataType(
-              dataRow, cellIndex, line, subProperty.getJavaType().getSimpleName(), fileField);
+        } else {
+          object = this.getAndValidateSubField(line, property, fileField, true);
         }
+
+        customValidatorService.checkAndValidateObjectData(
+            object, dataRow, fileField, cellIndex, line, logService);
       }
     }
   }
 
-  private boolean validateDataRequiredField(
+  public boolean validateDataRequiredField(
       String row[], int cell, int line, Class<?> model, String fieldName, FileField fileField)
       throws IOException, ClassNotFoundException {
 
     boolean flag = false;
-    String field = getField(fileField);
+    String field =
+        fileField.getIsJson()
+            ? customValidatorService.getJsonFieldName(fileField)
+            : this.getField(fileField);
     int importType = fileField.getImportType();
 
     Mapper mapper = advancedImportService.getMapper(model.getName());
@@ -546,17 +614,20 @@ public class ValidatorService {
     return flag;
   }
 
-  private Property getAndValidateSubField(
+  private Object getAndValidateSubField(
       int line, Property parentProp, FileField fileField, boolean isLog)
       throws IOException, ClassNotFoundException {
 
-    String field = getField(fileField);
+    String field =
+        fileField.getIsJson()
+            ? customValidatorService.getJsonFieldName(fileField)
+            : this.getField(fileField);
     Integer rowNum = fileField.getIsMatchWithFile() ? line : null;
     String[] subFields = fileField.getSubImportField().split("\\.");
     return this.getAndValidateSubField(subFields, 0, rowNum, parentProp, field, isLog);
   }
 
-  public Property getAndValidateSubField(
+  public Object getAndValidateSubField(
       String[] subFields,
       int index,
       Integer rowNum,
@@ -565,7 +636,7 @@ public class ValidatorService {
       boolean isLog)
       throws IOException, ClassNotFoundException {
 
-    Property subProperty = null;
+    Object subProperty = null;
 
     if (parentProp.getTarget() != null) {
       Mapper mapper = advancedImportService.getMapper(parentProp.getTarget().getName());
@@ -577,31 +648,45 @@ public class ValidatorService {
         }
       }
 
+      subProperty = childProp;
+      index += 1;
+
       if (childProp != null && childProp.getTarget() != null) {
-        if (index != subFields.length - 1) {
+        if (index < subFields.length) {
           subProperty =
-              this.getAndValidateSubField(subFields, index + 1, rowNum, childProp, field, isLog);
+              this.getAndValidateSubField(subFields, index, rowNum, childProp, field, isLog);
         } else {
-          subProperty = childProp;
           if (!isLog) {
             logService.addLog(BaseExceptionMessage.ADVANCED_IMPORT_LOG_4, field, rowNum);
           }
         }
-      } else {
-        subProperty = childProp;
+      } else if (childProp != null
+          && AdvancedExportService.FIELD_ATTRS.equals(childProp.getName())) {
+
+        return customValidatorService.getValidatedAttrsSubField(
+            subFields,
+            mapper.getBeanClass().getCanonicalName(),
+            field,
+            index,
+            rowNum,
+            isLog,
+            logService);
       }
     }
     return subProperty;
   }
 
-  private void validateDataType(String[] row, int cell, int line, String type, FileField fileField)
+  public void validateDataType(String[] row, int cell, int line, String type, FileField fileField)
       throws IOException {
 
     if (Strings.isNullOrEmpty(row[cell])) {
       return;
     }
 
-    String field = getField(fileField);
+    String field =
+        fileField.getIsJson()
+            ? customValidatorService.getJsonFieldName(fileField)
+            : getField(fileField);
     String value = row[cell].trim();
 
     switch (type) {
@@ -675,8 +760,8 @@ public class ValidatorService {
   private void checkDateTime(String value, int line, String type, FileField fileField)
       throws IOException {
 
-    if (!Strings.isNullOrEmpty(fileField.getDateFormat())
-        && Strings.isNullOrEmpty(fileField.getExpression())) {
+    if ((!Strings.isNullOrEmpty(fileField.getDateFormat())
+        && Strings.isNullOrEmpty(fileField.getExpression()))) {
 
       String pattern = fileField.getDateFormat().trim();
       try {
@@ -702,7 +787,12 @@ public class ValidatorService {
       } catch (DateTimeParseException e) {
         logService.addLog(
             BaseExceptionMessage.ADVANCED_IMPORT_LOG_9,
-            getField(fileField) + "(" + type + ")",
+            (fileField.getIsJson()
+                    ? customValidatorService.getJsonFieldName(fileField)
+                    : getField(fileField))
+                + "("
+                + type
+                + ")",
             line);
       }
     }

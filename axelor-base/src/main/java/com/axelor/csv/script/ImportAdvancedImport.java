@@ -20,6 +20,7 @@ package com.axelor.csv.script;
 import com.axelor.apps.base.db.FileTab;
 import com.axelor.apps.base.db.repo.FileTabRepository;
 import com.axelor.apps.base.service.advanced.imports.ActionService;
+import com.axelor.apps.base.service.advanced.imports.CustomAdvancedImportService;
 import com.axelor.common.ObjectUtils;
 import com.axelor.db.JPA;
 import com.axelor.db.Model;
@@ -27,6 +28,11 @@ import com.axelor.db.mapper.Mapper;
 import com.axelor.db.mapper.Property;
 import com.axelor.meta.MetaFiles;
 import com.axelor.meta.db.MetaFile;
+import com.axelor.meta.db.MetaJsonField;
+import com.axelor.meta.db.MetaJsonModel;
+import com.axelor.meta.db.MetaJsonRecord;
+import com.axelor.meta.db.repo.MetaJsonFieldRepository;
+import com.axelor.meta.db.repo.MetaJsonRecordRepository;
 import com.axelor.script.GroovyScriptHelper;
 import com.axelor.script.ScriptBindings;
 import com.axelor.script.ScriptHelper;
@@ -37,10 +43,12 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import wslite.json.JSONException;
@@ -52,7 +60,11 @@ public class ImportAdvancedImport {
 
   @Inject private FileTabRepository fileTabRepo;
 
+  @Inject private MetaJsonRecordRepository metaJsonRecordRepo;
+
   @Inject protected ActionService actionService;
+
+  @Inject private MetaJsonFieldRepository metaJsonFieldRepo;
 
   @SuppressWarnings("unchecked")
   public Object importGeneral(Object bean, Map<String, Object> values)
@@ -73,18 +85,13 @@ public class ImportAdvancedImport {
     }
 
     if (((Model) bean).getId() == null) {
-      List<Property> propList = this.getProperties(bean);
-      JPA.save((Model) bean);
-      this.addImportedRecordIds(bean, fileTab, fileTab.getMetaModel().getName(), values);
+      prepareRealObject(bean, values, fileTab);
+    }
 
-      for (Property prop : propList) {
+    if (((Model) bean).getClass().getSimpleName().equals("MetaJsonRecord")
+        && ((Model) bean).getVersion() == 0) {
 
-        this.addImportedRecordIds(
-            prop.get(bean),
-            fileTab,
-            StringUtils.substringAfterLast(prop.getTarget().getName(), "."),
-            values);
-      }
+      prepareCustomObject(bean, values, fileTab);
     }
 
     final String ACTIONS_TO_APPLY = "actionsToApply" + fileTab.getId();
@@ -92,6 +99,68 @@ public class ImportAdvancedImport {
       bean = actionService.apply(values.get(ACTIONS_TO_APPLY).toString(), bean);
     }
     return bean;
+  }
+
+  private void prepareRealObject(Object bean, Map<String, Object> values, FileTab fileTab)
+      throws JSONException {
+    List<Property> propList = this.getProperties(bean);
+    Mapper mapper = Mapper.of(bean.getClass());
+    Property property = mapper.getProperty("attrs");
+    String jsonString = (String) property.get(bean);
+    JSONObject jsonObject = new JSONObject(jsonString);
+    List<MetaJsonField> jsonFields = new ArrayList<>();
+    if (!jsonObject.isEmpty()) {
+      jsonFields = this.getRealModelJsonFields(bean.getClass().getCanonicalName(), jsonObject);
+    }
+    JPA.save((Model) bean);
+    this.addImportedRecordIds(bean, fileTab, fileTab.getMetaModel().getName(), values, false);
+
+    for (Property prop : propList) {
+
+      this.addImportedRecordIds(
+          prop.get(bean),
+          fileTab,
+          StringUtils.substringAfterLast(prop.getTarget().getName(), "."),
+          values,
+          false);
+    }
+
+    for (MetaJsonField field : jsonFields) {
+      jsonObject = (JSONObject) jsonObject.get(field.getName());
+      long id = jsonObject.getLong("id");
+      MetaJsonRecord record = new MetaJsonRecord();
+      record.setId(id);
+
+      this.addImportedRecordIds(
+          record, fileTab, field.getTargetJsonModel().getName(), values, true);
+    }
+  }
+
+  private void prepareCustomObject(Object bean, Map<String, Object> values, FileTab fileTab)
+      throws JSONException {
+    List<MetaJsonField> jsonFields =
+        this.getJsonFields((MetaJsonRecord) bean, fileTab.getJsonModel());
+    this.addImportedRecordIds(bean, fileTab, fileTab.getJsonModel().getName(), values, true);
+
+    for (MetaJsonField field : jsonFields) {
+      MetaJsonRecord record = (MetaJsonRecord) bean;
+      JSONObject jsonObject = new JSONObject(record.getAttrs());
+      jsonObject = (JSONObject) jsonObject.get(field.getName());
+      record = new MetaJsonRecord();
+      record.setId(jsonObject.getLong("id"));
+
+      if (Strings.isNullOrEmpty(field.getTargetModel())) {
+        this.addImportedRecordIds(
+            record, fileTab, field.getTargetJsonModel().getName(), values, true);
+      } else {
+        this.addImportedRecordIds(
+            record,
+            fileTab,
+            StringUtils.substringAfterLast(field.getTargetModel(), "."),
+            values,
+            false);
+      }
+    }
   }
 
   private List<Property> getProperties(Object bean) {
@@ -110,11 +179,14 @@ public class ImportAdvancedImport {
   }
 
   private void addImportedRecordIds(
-      Object bean, FileTab fileTab, String modelName, Map<String, Object> values)
+      Object bean, FileTab fileTab, String modelName, Map<String, Object> values, boolean isJson)
       throws JSONException {
     List<String> recordList = new ArrayList<>();
     JSONObject jsonObject = new JSONObject();
-    String id = ((Model) bean).getId().toString();
+    String recordId = ((Model) bean).getId().toString();
+
+    modelName = isJson ? "JSON_" + modelName : modelName;
+
     if (!Strings.isNullOrEmpty(fileTab.getImportedRecordIds())) {
       jsonObject = new JSONObject(fileTab.getImportedRecordIds());
     }
@@ -122,14 +194,64 @@ public class ImportAdvancedImport {
     if (!jsonObject.isEmpty()) {
       if (jsonObject.containsKey(modelName)) {
         String ids = (String) jsonObject.get(modelName);
-        recordList = new ArrayList<>(Arrays.asList(ids.split("\\.")));
+        recordList = new ArrayList<>(Arrays.asList(ids.split("\\,")));
       }
     }
 
-    recordList.add(id);
+    recordList.add(recordId);
     String recordIds = Joiner.on(",").join(recordList);
     jsonObject.put(modelName, recordIds);
     fileTab.setImportedRecordIds(jsonObject.toString());
+  }
+
+  private List<MetaJsonField> getJsonFields(MetaJsonRecord record, MetaJsonModel jsonModel)
+      throws JSONException {
+    List<MetaJsonField> jsonFields = new ArrayList<>();
+    for (MetaJsonField field : jsonModel.getFields()) {
+      if (record != null && !field.getType().endsWith("-many")) {
+        if (field.getTargetJsonModel() != null && !isAlreadyStored(record, field.getName())) {
+          jsonFields.add(field);
+        }
+      }
+    }
+    return jsonFields;
+  }
+
+  private boolean isAlreadyStored(MetaJsonRecord record, String field) throws JSONException {
+    JSONObject jsonObject = new JSONObject(record.getAttrs());
+    if (!jsonObject.isEmpty() && !jsonObject.isNull(field)) {
+      jsonObject = (JSONObject) jsonObject.get(field);
+      record = metaJsonRecordRepo.find(jsonObject.getLong("id"));
+      if (record != null && record.getVersion() == 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private List<MetaJsonField> getRealModelJsonFields(String model, JSONObject jsonObject)
+      throws JSONException {
+    List<MetaJsonField> jsonFields = new ArrayList<>();
+    if (!jsonObject.isEmpty()) {
+      for (MetaJsonField jsonField :
+          metaJsonFieldRepo.all().filter("self.model = ?1", model).fetch().stream()
+              .filter(
+                  field ->
+                      CustomAdvancedImportService.relationTypeList.contains(field.getType())
+                          && !field.getType().endsWith("-many"))
+              .collect(Collectors.toList())) {
+        if (jsonField.getTargetJsonModel() != null && !jsonObject.isNull(jsonField.getName())) {
+          jsonObject = (JSONObject) jsonObject.get(jsonField.getName());
+          MetaJsonRecord record = metaJsonRecordRepo.find(jsonObject.getLong("id"));
+          if (record != null
+              && record.getVersion() == 0
+              && record.getCreatedOn().isAfter(LocalDateTime.now().minusSeconds(5))) {
+            jsonFields.add(jsonField);
+          }
+        }
+      }
+    }
+    return jsonFields;
   }
 
   public Object importPicture(String value, String pathVal) throws IOException {

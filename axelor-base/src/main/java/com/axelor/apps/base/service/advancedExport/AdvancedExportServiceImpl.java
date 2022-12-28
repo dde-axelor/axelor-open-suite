@@ -37,9 +37,11 @@ import com.axelor.exception.service.TraceBackService;
 import com.axelor.i18n.I18n;
 import com.axelor.inject.Beans;
 import com.axelor.meta.db.MetaField;
+import com.axelor.meta.db.MetaJsonField;
 import com.axelor.meta.db.MetaModel;
 import com.axelor.meta.db.MetaSelect;
 import com.axelor.meta.db.repo.MetaFieldRepository;
+import com.axelor.meta.db.repo.MetaJsonFieldRepository;
 import com.axelor.meta.db.repo.MetaModelRepository;
 import com.axelor.meta.db.repo.MetaSelectRepository;
 import com.axelor.rpc.filter.Filter;
@@ -50,6 +52,7 @@ import com.google.common.collect.Maps;
 import com.google.inject.Inject;
 import java.io.File;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -68,16 +71,21 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
 
   @Inject private MetaFieldRepository metaFieldRepo;
 
+  @Inject private MetaJsonFieldRepository metaJsonFieldRepo;
+
   @Inject private MetaModelRepository metaModelRepo;
 
   @Inject private MetaSelectRepository metaSelectRepo;
 
   @Inject private AdvancedExportGeneratorFactory exportGeneratorFactory;
 
+  @Inject private CustomAdvancedExportService customExportService;
+
   private LinkedHashSet<String> joinFieldSet = new LinkedHashSet<>(),
       selectionJoinFieldSet = new LinkedHashSet<>();
 
   private List<Object> params = null;
+  private HashSet<String> aliasNameSet = new HashSet<>();
 
   private String exportFileName, language, selectField, aliasName;
   private boolean isReachMaxExportLimit, isNormalField, isSelectionField = false;
@@ -100,6 +108,8 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
     StringBuilder selectFieldBuilder = new StringBuilder();
     StringBuilder orderByFieldBuilder = new StringBuilder();
 
+    boolean isJson = advancedExport.getIsJson();
+
     joinFieldSet.clear();
     selectionJoinFieldSet.clear();
     isNormalField = true;
@@ -120,7 +130,11 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
         String[] splitField = advancedExportLine.getTargetField().split("\\.");
         String alias = "Col_" + col;
 
-        createQueryParts(splitField, 0, advancedExport.getMetaModel());
+        if (isJson) {
+          customExportService.createCustomQueryParts(splitField, advancedExport.getJsonModel());
+        } else {
+          createQueryParts(splitField, 0, advancedExport.getMetaModel());
+        }
 
         selectFieldBuilder.append(aliasName + selectField + " AS " + alias + ",");
 
@@ -138,8 +152,14 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
       TraceBackService.trace(e);
       throw new AxelorException(e, TraceBackRepository.CATEGORY_CONFIGURATION_ERROR);
     }
-    return createQuery(
-        createQueryBuilder(advancedExport, selectFieldBuilder, recordIds, orderByFieldBuilder));
+    if (isJson) {
+      return createQuery(
+          customExportService.createQueryBuilder(
+              advancedExport, selectFieldBuilder, recordIds, orderByFieldBuilder));
+    } else {
+      return createQuery(
+          createQueryBuilder(advancedExport, selectFieldBuilder, recordIds, orderByFieldBuilder));
+    }
   }
 
   /**
@@ -159,14 +179,22 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
               .all()
               .filter("self.name = ?1 and self.metaModel = ?2", splitField[parentIndex], metaModel)
               .fetchOne();
-      MetaModel subMetaModel =
-          metaModelRepo.all().filter("self.name = ?1", relationalField.getTypeName()).fetchOne();
+      MetaModel subMetaModel = metaModelRepo.findByName(relationalField.getTypeName());
 
       if (!Strings.isNullOrEmpty(relationalField.getRelationship())) {
         checkRelationalField(splitField, parentIndex);
+
+      } else if (FIELD_ATTRS.equals(relationalField.getName())) {
+        checkJsonRelationField(
+            splitField,
+            parentIndex + 1,
+            parentIndex == 0 ? "self" : aliasName,
+            metaModel.getFullName());
+
+        break;
       } else {
-        checkSelectionField(splitField, parentIndex, metaModel);
-        checkNormalField(splitField, parentIndex);
+        checkSelectionField(splitField, parentIndex, metaModel.getFullName());
+        checkNormalField(splitField, parentIndex, false);
       }
       parentIndex += 1;
       metaModel = subMetaModel;
@@ -183,15 +211,118 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
       for (int subIndex = 1; subIndex <= parentIndex; subIndex++) {
         tempAliasName = isKeyword(splitField, subIndex);
         if (!aliasName.equals(splitField[parentIndex])) {
+          tempAliasName = isSameAlias(tempAliasName);
           joinFieldSet.add(
               "LEFT JOIN " + aliasName + "." + splitField[subIndex] + " " + tempAliasName);
           aliasName = tempAliasName;
         }
       }
     } else {
-      tempAliasName = isKeyword(splitField, parentIndex);
+      tempAliasName = isSameAlias(isKeyword(splitField, parentIndex));
       joinFieldSet.add("LEFT JOIN self." + splitField[parentIndex] + " " + tempAliasName);
       aliasName = tempAliasName;
+    }
+  }
+
+  private void checkJsonRelationField(
+      String[] splitField, int index, String tempAlias, String uniqueModel)
+      throws ClassNotFoundException {
+    isNormalField = false;
+    for (int count = index; count < splitField.length; count++) {
+      String tempAliasName = isKeyword(splitField, count);
+      String fieldName = splitField[count];
+      MetaJsonField jsonField =
+          metaJsonFieldRepo
+              .all()
+              .filter("self.name = ?1 AND self.uniqueModel = ?2", fieldName, uniqueModel)
+              .fetchOne();
+
+      if (jsonField.getTargetJsonModel() != null) {
+        if ("id".equals(splitField[count + 1])) {
+          selectField = "json_extract_integer(self.attrs,'" + fieldName + "','id')";
+          break;
+        }
+
+        tempAliasName = isSameAlias(tempAliasName);
+        joinFieldSet.add(
+            "LEFT JOIN MetaJsonRecord "
+                + tempAliasName
+                + " ON "
+                + tempAliasName
+                + ".id = json_extract_integer("
+                + tempAlias
+                + ".attrs,'"
+                + fieldName
+                + "','id')");
+
+        tempAlias = tempAliasName;
+        uniqueModel = META_JSON_RECORD_FULL_NAME + " " + jsonField.getTargetJsonModel().getName();
+
+      } else if (!Strings.isNullOrEmpty(jsonField.getTargetModel())) {
+
+        tempAliasName = isSameAlias(tempAliasName);
+        joinFieldSet.add(
+            "LEFT JOIN "
+                + jsonField.getTargetModel()
+                + " "
+                + tempAliasName
+                + " ON "
+                + tempAliasName
+                + ".id = json_extract_integer("
+                + tempAlias
+                + ".attrs,'"
+                + fieldName
+                + "','id')");
+
+        tempAlias = tempAliasName;
+        uniqueModel = jsonField.getTargetModel();
+
+        if (count == splitField.length - 2) {
+          aliasName = tempAliasName;
+          checkSelectionField(splitField, count + 1, uniqueModel);
+          checkNormalField(splitField, count + 1, false);
+
+        } else {
+          checkJsonRealRelationField(splitField, count + 1, tempAlias, uniqueModel);
+        }
+      } else {
+        aliasName = tempAlias;
+        checkJsonSelectionField(splitField, count, jsonField);
+        checkNormalField(splitField, count, true);
+      }
+    }
+  }
+
+  private void checkJsonRealRelationField(
+      String[] splitField, int index, String tempAlias, String uniqueModel)
+      throws ClassNotFoundException {
+    for (int count = index; count < splitField.length - 1; count++) {
+      String fieldName = splitField[count];
+      MetaField metaField =
+          metaFieldRepo
+              .all()
+              .filter("self.name = ?1 AND self.metaModel.fullName = ?2", fieldName, uniqueModel)
+              .fetchOne();
+
+      if (!Strings.isNullOrEmpty(metaField.getRelationship())) {
+        uniqueModel = metaField.getPackageName() + "." + metaField.getTypeName();
+      }
+
+      String tempAliasName = isKeyword(splitField, count);
+      if (FIELD_ATTRS.equals(fieldName)) {
+        checkJsonRelationField(splitField, count + 1, tempAlias, uniqueModel);
+        break;
+      }
+
+      if (count == splitField.length - 2) {
+        aliasName = tempAliasName;
+        checkSelectionField(splitField, count + 1, uniqueModel);
+        checkNormalField(splitField, count + 1, false);
+      }
+
+      tempAliasName = isSameAlias(tempAliasName);
+      joinFieldSet.add("LEFT JOIN " + tempAlias + "." + fieldName + " " + tempAliasName);
+      tempAlias = tempAliasName;
     }
   }
 
@@ -202,10 +333,19 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
     return fieldNames[ind];
   }
 
-  private void checkSelectionField(String[] fieldName, int index, MetaModel metaModel)
+  private String isSameAlias(String alias) {
+    if (aliasNameSet.contains(alias)) {
+      String startWith = alias;
+      alias += "_" + (aliasNameSet.stream().filter(name -> name.startsWith(startWith)).count());
+    }
+    aliasNameSet.add(alias);
+    return alias;
+  }
+
+  private void checkSelectionField(String[] fieldName, int index, String metaModelFullName)
       throws ClassNotFoundException {
 
-    Class<?> klass = Class.forName(metaModel.getFullName());
+    Class<?> klass = Class.forName(metaModelFullName);
     Mapper mapper = Mapper.of(klass);
     List<MetaSelect> metaSelectList =
         metaSelectRepo
@@ -221,20 +361,43 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
       if (!isNormalField && index != 0) {
         alias = aliasName;
       }
-      addSelectionField(fieldName[index], alias, StringTool.getIdListString(metaSelectList));
+      addSelectionField(fieldName[index], alias, StringTool.getIdListString(metaSelectList), false);
     }
   }
 
-  private void addSelectionField(String fieldName, String alias, String metaSelectIds) {
+  private void checkJsonSelectionField(String[] fieldName, int index, MetaJsonField jsonField) {
+    MetaSelect metaSelect = metaSelectRepo.findByName(jsonField.getSelection());
+
+    if (metaSelect != null) {
+      isSelectionField = true;
+      String alias = "self";
+
+      msi++;
+      mt++;
+
+      if (!isNormalField && index != 0) {
+        alias = aliasName;
+      }
+
+      aliasName = "";
+      addSelectionField(fieldName[index], alias, metaSelect.getId().toString(), true);
+    }
+  }
+
+  private void addSelectionField(
+      String fieldName, String alias, String metaSelectIds, boolean isJson) {
+    String field =
+        isJson
+            ? "json_extract(" + alias + ".attrs,'" + fieldName + "')"
+            : "CAST(" + alias + "." + fieldName + " AS text)";
+
     String selectionJoin =
         "LEFT JOIN "
             + "MetaSelectItem "
             + ("msi_" + (msi))
-            + " ON CAST("
-            + alias
-            + "."
-            + fieldName
-            + " AS text) = "
+            + " ON "
+            + field
+            + " = "
             + ("msi_" + (msi))
             + ".value AND "
             + ("msi_" + (msi))
@@ -260,7 +423,7 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
     selectionJoinFieldSet.add(selectionJoin);
   }
 
-  private void checkNormalField(String[] splitField, int parentIndex) {
+  private void checkNormalField(String[] splitField, int parentIndex, boolean isJson) {
 
     if (isSelectionField) {
       if (parentIndex == 0) {
@@ -286,7 +449,11 @@ public class AdvancedExportServiceImpl implements AdvancedExportService {
         selectField = "";
         aliasName = "self";
       }
-      selectField += "." + splitField[parentIndex];
+      selectField +=
+          isJson
+              ? "json_extract(" + aliasName + ".attrs,'" + splitField[parentIndex] + "')"
+              : "." + splitField[parentIndex];
+      aliasName = isJson ? "" : aliasName;
     }
   }
 
